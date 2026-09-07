@@ -69,15 +69,6 @@ function Get-ActivityBar {
     return (Get-BarGraph -Used $Percent -Total 100 -Width $width) + (" {0,3}%" -f $Percent)
 }
 
-function Get-CounterValue {
-    param([string]$Path)
-    try {
-        return (Get-Counter -Counter $Path -ErrorAction Stop).CounterSamples[0].CookedValue
-    } catch {
-        return 0
-    }
-}
-
 # ---------------------------------------------------------------------------
 # Printing (mirrors the original PRINT_* functions 1:1)
 # ---------------------------------------------------------------------------
@@ -140,15 +131,30 @@ function Print-Data {
     Write-Host ($chV + " " + $Name.PadRight($MaxNameLen) + " " + $chV + " " + $Data + " " + $chV)
 }
 
-# ---------------------------------------------------------------------------
-# Data collection (Windows-native sources)
-# ---------------------------------------------------------------------------
-$os = Get-CimInstance Win32_OperatingSystem
-$cs = Get-CimInstance Win32_ComputerSystem
+# Sum of every process's CPU time (100ns ticks). Sampled twice around a short
+# window to derive CPU% without WMI or performance counters.
+function Get-CpuTicks {
+    $sum = 0
+    foreach ($proc in [System.Diagnostics.Process]::GetProcesses()) {
+        try { $sum += $proc.TotalProcessorTime.Ticks } catch { }
+        $proc.Dispose()
+    }
+    return $sum
+}
 
-# Operating System Information
-$os_name   = ($os.Caption -replace '^Microsoft\s+', '').Trim() + " " + $os.BuildNumber
-$os_kernel = "Windows NT " + $os.Version
+# ---------------------------------------------------------------------------
+# Data collection (registry / .NET only - no WMI/CIM, which is slow to warm up)
+# ---------------------------------------------------------------------------
+Add-Type -AssemblyName Microsoft.VisualBasic
+
+# Operating System Information (from the registry)
+$os_reg = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' `
+    -Name CurrentBuildNumber, EditionID, CurrentMajorVersionNumber, CurrentMinorVersionNumber `
+    -ErrorAction SilentlyContinue
+$os_build   = [int]$os_reg.CurrentBuildNumber
+$os_product = if ($os_build -ge 22000) { 'Windows 11' } else { 'Windows 10' }
+$os_name    = "$os_product $($os_reg.EditionID) $os_build"
+$os_kernel  = "Windows NT $($os_reg.CurrentMajorVersionNumber).$($os_reg.CurrentMinorVersionNumber).$os_build"
 
 # Network Information
 $net_current_user = "$env:USERDOMAIN\$env:USERNAME"
@@ -160,30 +166,49 @@ try {
 }
 if ([string]::IsNullOrWhiteSpace($net_hostname)) { $net_hostname = "Not Defined" }
 
-# Prefer the internet-facing adapter (the one carrying the default route) so
-# WSL / Hyper-V / Docker virtual switches don't shadow the real LAN address.
-$primary_if = $null
+# Machine IP + DNS via .NET (milliseconds), preferring the internet-facing
+# adapter (the one carrying an IPv4 gateway) so WSL / Hyper-V / Docker virtual
+# switches don't shadow the real LAN address. Avoids the very slow
+# Get-NetIPConfiguration cmdlet.
+$net_machine_ip = "No IP found"
+$net_dns_ip     = @()
 try {
-    $primary_if = Get-NetIPConfiguration -ErrorAction Stop |
-        Where-Object { $_.IPv4DefaultGateway -and $_.NetAdapter.Status -eq 'Up' } |
-        Select-Object -First 1
-} catch { }
+    $nics = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object {
+            $_.OperationalStatus -eq 'Up' -and
+            $_.NetworkInterfaceType -ne 'Loopback' -and
+            $_.NetworkInterfaceType -ne 'Tunnel'
+        }
 
-$ipv4 = $null
-if ($primary_if) { $ipv4 = ($primary_if.IPv4Address | Select-Object -First 1).IPAddress }
-if (-not $ipv4) {
-    $ipv4 = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
-        Select-Object -First 1 -ExpandProperty IPAddress
-}
-if (-not $ipv4) {
-    $ipv6 = Get-NetIPAddress -AddressFamily IPv6 -ErrorAction SilentlyContinue |
-        Where-Object { $_.IPAddress -ne '::1' -and $_.IPAddress -notlike 'fe80*' } |
-        Select-Object -First 1 -ExpandProperty IPAddress
-}
-if     ($ipv4) { $net_machine_ip = $ipv4 }
-elseif ($ipv6) { $net_machine_ip = $ipv6 }
-else           { $net_machine_ip = "No IP found" }
+    $primary = $null
+    foreach ($n in $nics) {
+        $gw = $n.GetIPProperties().GatewayAddresses |
+            Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -ne '0.0.0.0' }
+        if ($gw) { $primary = $n; break }
+    }
+    if (-not $primary) { $primary = $nics | Select-Object -First 1 }
+
+    if ($primary) {
+        $props = $primary.GetIPProperties()
+        $ip = $props.UnicastAddresses |
+            Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -notlike '169.254.*' } |
+            Select-Object -First 1
+        if ($ip) {
+            $net_machine_ip = $ip.Address.ToString()
+        } else {
+            $ip6 = $props.UnicastAddresses |
+                Where-Object { $_.Address.AddressFamily -eq 'InterNetworkV6' -and -not $_.Address.IsIPv6LinkLocal } |
+                Select-Object -First 1
+            if ($ip6) { $net_machine_ip = $ip6.Address.ToString() }
+        }
+        $net_dns_ip = @(
+            $props.DnsAddresses |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' -and $_.ToString() -notlike '127.*' } |
+                ForEach-Object { $_.ToString() } |
+                Select-Object -Unique
+        )
+    }
+} catch { }
 
 if ($env:SSH_CLIENT) {
     $net_client_ip = ($env:SSH_CLIENT -split '\s+')[0]
@@ -191,116 +216,104 @@ if ($env:SSH_CLIENT) {
     $net_client_ip = "Not connected"
 }
 
-# Scope DNS to the primary interface when known, else fall back to all of them.
-if ($primary_if -and $primary_if.DNSServer) {
-    $net_dns_ip = @(
-        $primary_if.DNSServer |
-            Where-Object { $_.AddressFamily -eq 2 } |     # 2 = IPv4
-            ForEach-Object { $_.ServerAddresses } |
-            Where-Object   { $_ -and $_ -notlike '127.*' } |
-            Select-Object -Unique
-    )
-} else {
-    $net_dns_ip = @()
-}
-if ($net_dns_ip.Count -eq 0) {
-    $net_dns_ip = @(
-        Get-DnsClientServerAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            ForEach-Object { $_.ServerAddresses } |
-            Where-Object   { $_ -and $_ -notlike '127.*' } |
-            Select-Object -Unique
-    )
-}
+# --- Activity sample, snapshot 1 (t0). The static collection below doubles as
+# the sampling window, so CPU% / NETWORK% add almost no extra wall-clock. ---
+$act_cpu0 = Get-CpuTicks
+$act_net0 = 0.0
+if ($primary) { $s0 = $primary.GetIPStatistics(); $act_net0 = [double]$s0.BytesReceived + [double]$s0.BytesSent }
+$act_q0 = [System.Diagnostics.Stopwatch]::GetTimestamp()
 
-# CPU Information
-$cpus  = @(Get-CimInstance Win32_Processor)
-$cpu0  = $cpus[0]
+# CPU Information (model + frequency from the registry, logical count from .NET)
+$cpu_reg_key  = 'HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0'
+$cpu_model    = [string][Microsoft.Win32.Registry]::GetValue($cpu_reg_key, 'ProcessorNameString', '')
+$cpu_freq_mhz = [double][Microsoft.Win32.Registry]::GetValue($cpu_reg_key, '~MHz', 0)
 
-$cpu_model = $cpu0.Name
 $cpu_model = $cpu_model -replace '\((R|TM|r|tm)\)', '' -replace '\s+CPU', '' -replace '@.*$', ''
 $cpu_model = ($cpu_model -replace '\s+', ' ').Trim()
 if ($cpu_model.Length -gt 30) { $cpu_model = $cpu_model.Substring(0, 27) + "..." }
 
-$cpu_sockets = $cpus.Count
-$cpu_vcpus   = $cpu0.NumberOfLogicalProcessors
+$cpu_vcpus   = [Environment]::ProcessorCount
+$cpu_sockets = 1   # workstation assumption; edit for a multi-socket server
+$cpu_freq    = "{0:N2}" -f ($cpu_freq_mhz / 1000)
 
-# Hypervisor / bare metal detection from the system model signature
-$model = "$($cs.Manufacturer) $($cs.Model)"
+# Hypervisor / bare metal detection from the BIOS system model signature
+$bios_reg = Get-ItemProperty 'HKLM:\HARDWARE\DESCRIPTION\System\BIOS' `
+    -Name SystemManufacturer, SystemProductName -ErrorAction SilentlyContinue
+$model = "$($bios_reg.SystemManufacturer) $($bios_reg.SystemProductName)"
 switch -Regex ($model) {
-    'VMware'                { $cpu_hypervisor = 'VMware';     break }
-    'VirtualBox'            { $cpu_hypervisor = 'VirtualBox'; break }
-    'Hyper-V|Virtual Machine' { $cpu_hypervisor = 'Hyper-V';  break }
-    'KVM|QEMU|Bochs'        { $cpu_hypervisor = 'KVM';        break }
-    'Xen'                   { $cpu_hypervisor = 'Xen';        break }
-    default                 { $cpu_hypervisor = 'Bare Metal' }
+    'VMware'                  { $cpu_hypervisor = 'VMware';     break }
+    'VirtualBox'              { $cpu_hypervisor = 'VirtualBox'; break }
+    'Hyper-V|Virtual Machine' { $cpu_hypervisor = 'Hyper-V';   break }
+    'KVM|QEMU|Bochs'          { $cpu_hypervisor = 'KVM';        break }
+    'Xen'                     { $cpu_hypervisor = 'Xen';        break }
+    default                   { $cpu_hypervisor = 'Bare Metal' }
 }
 
-$cpu_freq_mhz = $cpu0.MaxClockSpeed
-if (-not $cpu_freq_mhz -or $cpu_freq_mhz -eq 0) { $cpu_freq_mhz = $cpu0.CurrentClockSpeed }
-$cpu_freq = "{0:N2}" -f ($cpu_freq_mhz / 1000)
+# Memory Information (Microsoft.VisualBasic ComputerInfo -> bytes, no WMI)
+$comp_info    = New-Object Microsoft.VisualBasic.Devices.ComputerInfo
+$mem_total    = [double]$comp_info.TotalPhysicalMemory
+$mem_avail    = [double]$comp_info.AvailablePhysicalMemory
+$mem_used     = $mem_total - $mem_avail
+$mem_percent  = "{0:N2}" -f ($mem_used / $mem_total * 100)
+$mem_total_gb = "{0:N2}" -f ($mem_total / 1GB)
+$mem_used_gb  = "{0:N2}" -f ($mem_used  / 1GB)
 
-# Activity (CPU / DISK I/O / NETWORK), sourced live from performance counters
-$cpu_activity = [int][math]::Round((Get-CounterValue '\Processor(_Total)\% Processor Time'))
-
-$disk_activity = [int][math]::Round((Get-CounterValue '\PhysicalDisk(_Total)\% Disk Time'))
-if ($disk_activity -gt 100) { $disk_activity = 100 }
-
-$net_activity = 0
-try {
-    $netBytes = (Get-Counter '\Network Interface(*)\Bytes Total/sec' -ErrorAction Stop).CounterSamples
-    $netBw    = (Get-Counter '\Network Interface(*)\Current Bandwidth' -ErrorAction Stop).CounterSamples
-    $bwMap = @{}
-    foreach ($s in $netBw) { $bwMap[$s.InstanceName] = $s.CookedValue }
-    foreach ($s in $netBytes) {
-        if ($s.InstanceName -match 'loopback|isatap|teredo') { continue }
-        $bw = $bwMap[$s.InstanceName]
-        if ($bw -gt 0) {
-            $u = ($s.CookedValue * 8 / $bw) * 100
-            if ($u -gt $net_activity) { $net_activity = $u }
-        }
-    }
-} catch {
-    $net_activity = 0
-}
-$net_activity = [int][math]::Round([math]::Min($net_activity, 100))
-
-# Memory Information (KiB from CIM -> GiB)
-$mem_total   = [double]$os.TotalVisibleMemorySize
-$mem_avail   = [double]$os.FreePhysicalMemory
-$mem_used    = $mem_total - $mem_avail
-$mem_percent = "{0:N2}" -f ($mem_used / $mem_total * 100)
-$mem_total_gb = "{0:N2}" -f ($mem_total / 1024 / 1024)
-$mem_used_gb  = "{0:N2}" -f ($mem_used  / 1024 / 1024)
-
-# Disk Information (the configured volume)
-$vol = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='$VolumeDrive'"
-$root_total    = [double]$vol.Size
-$root_free     = [double]$vol.FreeSpace
+# Disk Information (the configured volume) via .NET DriveInfo (instant, no WMI)
+$drive         = [System.IO.DriveInfo]::new($VolumeDrive)
+$root_total    = [double]$drive.TotalSize
+$root_free     = [double]$drive.TotalFreeSpace
 $root_used     = $root_total - $root_free
 $root_total_gb = "{0:N2}" -f ($root_total / 1GB)
 $root_used_gb  = "{0:N2}" -f ($root_used  / 1GB)
 $disk_percent  = "{0:N2}" -f ($root_used / $root_total * 100)
 
-# Last login and uptime
+# Uptime from the system tick count (instant, no WMI). TickCount64 exists on
+# PowerShell 7; on Windows PowerShell 5.1 (.NET Framework) it is absent, so fall
+# back to the 32-bit tick read as unsigned (accurate up to ~49.7 days).
+try { $uptime_ms = [double][Environment]::TickCount64 } catch { $uptime_ms = 0 }
+if (-not $uptime_ms) {
+    $uptime_ms = [double][BitConverter]::ToUInt32([BitConverter]::GetBytes([Environment]::TickCount), 0)
+}
+$uptime     = [TimeSpan]::FromMilliseconds($uptime_ms)
+$sys_uptime = "{0}d {1}h {2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+
+# Last login via quser (WMI-free); best-effort, falls back to N/A
 $last_login_time = "N/A"
 try {
-    $session = Get-CimInstance Win32_LogonSession -ErrorAction Stop |
-        Where-Object { $_.LogonType -in 2, 10, 11 } |
-        Sort-Object -Property StartTime -Descending |
-        Select-Object -First 1
-    if ($session -and $session.StartTime) {
-        $last_login_time = ([datetime]$session.StartTime).ToString("MMM dd HH:mm yyyy")
+    $quser_lines = quser 2>$null
+    if ($quser_lines) {
+        foreach ($line in $quser_lines) {
+            if ($line -match "^\s*>?\s*$([regex]::Escape($env:USERNAME))\b") {
+                $m = [regex]::Match($line, '\d{1,2}[/.]\d{1,2}[/.]\d{2,4}\s+\d{1,2}:\d{2}(:\d{2})?(\s*[AP]M)?')
+                if ($m.Success) { $last_login_time = $m.Value.Trim() }
+                break
+            }
+        }
     }
 } catch { }
-if ($last_login_time -eq "N/A") {
-    try {
-        $lu = (Get-LocalUser -Name $env:USERNAME -ErrorAction Stop).LastLogon
-        if ($lu) { $last_login_time = $lu.ToString("MMM dd HH:mm yyyy") } else { $last_login_time = "Never logged in" }
-    } catch { }
-}
 
-$uptime      = (Get-Date) - $os.LastBootUpTime
-$sys_uptime  = "{0}d {1}h {2}m" -f $uptime.Days, $uptime.Hours, $uptime.Minutes
+# --- Activity sample, snapshot 2 (t1). Guarantee at least a 150ms window. ---
+$act_elapsed_ms = ([System.Diagnostics.Stopwatch]::GetTimestamp() - $act_q0) * 1000.0 / [System.Diagnostics.Stopwatch]::Frequency
+if ($act_elapsed_ms -lt 150) { Start-Sleep -Milliseconds ([int](150 - $act_elapsed_ms)) }
+$act_cpu1 = Get-CpuTicks
+$act_net1 = 0.0
+if ($primary) { $s1 = $primary.GetIPStatistics(); $act_net1 = [double]$s1.BytesReceived + [double]$s1.BytesSent }
+$act_sec  = ([System.Diagnostics.Stopwatch]::GetTimestamp() - $act_q0) / [System.Diagnostics.Stopwatch]::Frequency
+
+$cpu_activity = 0
+if ($act_sec -gt 0) {
+    $cpu_activity = [int][math]::Round((($act_cpu1 - $act_cpu0) / ([System.TimeSpan]::TicksPerSecond * $act_sec * [Environment]::ProcessorCount)) * 100)
+}
+if ($cpu_activity -lt 0)   { $cpu_activity = 0 }
+if ($cpu_activity -gt 100) { $cpu_activity = 100 }
+
+$net_activity = 0
+if ($primary -and $primary.Speed -gt 0 -and $act_sec -gt 0) {
+    $net_bps = (($act_net1 - $act_net0) * 8) / $act_sec
+    $net_activity = [int][math]::Round(($net_bps / $primary.Speed) * 100)
+}
+if ($net_activity -lt 0)   { $net_activity = 0 }
+if ($net_activity -gt 100) { $net_activity = 100 }
 
 # Cores label
 $cpu_cores_line = "$cpu_vcpus vCPU(s) / $cpu_sockets Socket(s)"
@@ -327,11 +340,10 @@ $script:CurrentLen = Get-MaxLength @(
 )
 
 # Create graphs
-$cpu_bar     = Get-ActivityBar $cpu_activity
-$disk_io_bar = Get-ActivityBar $disk_activity
-$net_bar     = Get-ActivityBar $net_activity
-$mem_bar     = Get-BarGraph $mem_used  $mem_total
-$disk_bar    = Get-BarGraph $root_used $root_total
+$cpu_bar  = Get-ActivityBar $cpu_activity
+$net_bar  = Get-ActivityBar $net_activity
+$mem_bar  = Get-BarGraph $mem_used  $mem_total
+$disk_bar = Get-BarGraph $root_used $root_total
 
 # ---------------------------------------------------------------------------
 # Machine Report
@@ -358,7 +370,6 @@ Print-Data "CORES"      $cpu_cores_line
 Print-Data "HYPERVISOR" $cpu_hypervisor
 Print-Data "CPU FREQ"   "$cpu_freq GHz"
 Print-Data "CPU"        $cpu_bar
-Print-Data "DISK I/O"   $disk_io_bar
 Print-Data "NETWORK"    $net_bar
 Print-Divider
 Print-Data "VOLUME"     "$root_used_gb/$root_total_gb GB [$disk_percent%]"

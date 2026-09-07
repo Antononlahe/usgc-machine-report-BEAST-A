@@ -12,8 +12,8 @@ This fork is Windows-only. The original bash script has been dropped; everything
 
 ## What differs from the original bash version
 
-- **Native Windows data sources.** OS/kernel, hostname, IPs, DNS, CPU, memory, disk, uptime and last login all come from CIM/`Get-Net*`/performance counters instead of `/proc`, `lscpu`, `zfs`, etc.
-- **Activity monitor replaces Unix load average.** Windows keeps no 1/5/15-minute load history, so the `LOAD` section is replaced by three live bars: `CPU` (% processor time), `DISK I/O` (% disk time), and `NETWORK` (link utilization).
+- **Native Windows data sources, no WMI.** OS/kernel, CPU, memory, disk, uptime and hostname come from the registry and .NET (`Microsoft.VisualBasic.Devices.ComputerInfo`, `DriveInfo`, `NetworkInterface`), not `/proc`, `lscpu`, `zfs`. WMI/CIM is avoided on purpose - a single CIM call pays ~0.5s of provider warmup - so the report renders in roughly 1.3s instead of ~3s.
+- **Activity monitor replaces Unix load average.** Windows keeps no 1/5/15-minute load history, so the `LOAD` section is replaced by two live bars sampled over a short (~150ms) window: `CPU` (% busy across all logical processors) and `NETWORK` (link utilization of the primary adapter). Live disk I/O was intentionally dropped - it has no fast non-WMI source - but disk *capacity* is still shown below.
 - **ZFS section removed.** There is no ZFS on Windows; the report shows the configured volume (default `C:`).
 
 # Software Philosophy
@@ -40,9 +40,12 @@ This port targets a normal Windows workstation or server:
 If your system is different, look up the offending line and adapt it.
 
 # Dependencies
-- PowerShell 5.1+ (all cmdlets used are built in: CIM, `Get-Counter`, `Get-NetIPConfiguration`, `Get-DnsClientServerAddress`)
+- Windows PowerShell 5.1 or PowerShell 7+. Everything is built in - registry access, .NET types, and `quser` for last login.
 
-Performance-counter names (`\Processor(_Total)\% Processor Time`, etc.) are English. On a non-English Windows install the counter paths are localized; each counter read is wrapped so a miss degrades to `0` rather than erroring, but you may want to substitute your locale's counter names.
+Notes:
+- `LAST LOGIN` is read from `quser` and parsed best-effort; if the output can't be parsed it shows `N/A`. `quser` ships with Pro/Enterprise/Server editions.
+- `UPTIME` uses `TickCount64` on PowerShell 7; on 5.1 it falls back to the 32-bit tick counter, which is accurate up to ~49.7 days of uptime.
+- `CORES` assumes a single socket (the common workstation case). Edit `$cpu_sockets` for a multi-socket server.
 
 # Installation
 
