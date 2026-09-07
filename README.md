@@ -1,59 +1,69 @@
 NOT MAINTAINED ON PURPOSE. DIG INTO THE SCRIPT AND ADAPT IT FOR YOUR OWN USE CASE. CUSTOMIZE IT TO YOUR HEARTS CONTENT.
 
-# TR-100 Machine Report
+# TR-100 Machine Report (Windows / PowerShell)
 SKU: TR-100, filed under Technical Reports (TR).
 
 What is it?
-A machine information report used at [United States Graphics Company](https://x.com/usgraphics)
+A machine information report used at [United States Graphics Company](https://x.com/usgraphics).
 
-"Machine Report" is similar to Neofetch, but very basic. It's a bash script that's linked in the user's login startup script, `.bashrc` or `.bash_profile`; it displays useful machine information right in the terminal session. Typically, at U.S. Graphics Company, we use it for remote servers and Machine Report is displayed when a user logs into the server over ssh. See installation instructions on how to do this.
+"Machine Report" is similar to Neofetch, but very basic. This is a **native Windows PowerShell port** of the original bash script: it displays useful machine information right in the terminal session. Reference it from your PowerShell profile and it prints when you open a new shell (or log into the box over SSH). See installation instructions below.
 
-<img src="https://github.com/usgraphics/TR-100/assets/8161031/2a8412dd-09de-45ff-8dfb-e5c6b6f19212" width="500" />
+This fork is Windows-only. The original bash script has been dropped; everything lives in `machine_report.ps1`.
+
+## What differs from the original bash version
+
+- **Native Windows data sources.** OS/kernel, hostname, IPs, DNS, CPU, memory, disk, uptime and last login all come from CIM/`Get-Net*`/performance counters instead of `/proc`, `lscpu`, `zfs`, etc.
+- **Activity monitor replaces Unix load average.** Windows keeps no 1/5/15-minute load history, so the `LOAD` section is replaced by three live bars: `CPU` (% processor time), `DISK I/O` (% disk time), and `NETWORK` (link utilization).
+- **ZFS section removed.** There is no ZFS on Windows; the report shows the configured volume (default `C:`).
 
 # Software Philosophy
-Since it is a bash script, you've got the source code. Just modify that for your needs. No need for any abstractions, directly edit the code. No modules, no DSL, no config files, none of it. Single file for easy deployment. Only abstraction that's acceptable is variables at the top of the script to customize the system, but it should stay minimal. 
+Since it is a script, you've got the source code. Just modify that for your needs. No modules, no DSL, no config files, none of it. Single file for easy deployment. The only abstraction that's acceptable is variables at the top of the script to customize the system, and it stays minimal (`$ReportTitle`, `$VolumeDrive`).
 
-Problem with providing tools with a silver spoon is that you kill the creativity of the users. Remember MySpace? Let people customize the hell out of it and share it. Central theme as you'll see is this:
+Problem with providing tools with a silver spoon is that you kill the creativity of the users. Remember MySpace? Let people customize the hell out of it and share it. Central theme:
 
 ```
 ENCOURAGE USERS TO DIRECTLY EDIT THE SOURCE
 ```
 
-When you build a templating engine, a config file, a bunch of switches, etc; it adds 1) bloat 2) complexity 3) limits customization because by definition, customization template engine is going to be less featureful than the source code itself. So let the users just edit the source. Keep it well organized.
-
-Another consideration is to avoid abstracting the source code at the expense of direct 1:1 readability. For e.g., the section "Machine Report" at the end of the bash script prints the output using `printf`—a whole bunch load of `printf` statements. There is no need to add loops or functions returning functions. What you see is roughly what will print. 1:1 mapping is important here for visual ID.
+The "Machine Report" section at the end of the script prints the output with a straight run of `Print-Data` calls - a near 1:1 mapping to what appears on screen, so it's easy to read and reorder.
 
 # Design Philosophy
-Tabular, short, clear and concise. The tool's job is to inform the user of the current state of the system they are logging in or are operating. No emojis (except for the one used as a warning sign). No colors (as default, might add an option to add colors).
+Tabular, short, clear and concise. The tool's job is to inform the user of the current state of the system they are operating. No emojis, no colors (default).
 
 # Assumed Setup
-This script is designed for us, for our internal use.
+This port targets a normal Windows workstation or server:
 
-- AMD EPYC CPU
-- Debian OS
-- ZFS installed on root partition
-- VMWare Hypervisor
+- Windows 10/11 or Windows Server
+- Windows PowerShell 5.1 or PowerShell 7+
+- A UTF-8 capable terminal (Windows Terminal recommended) for the box-drawing and bar glyphs
+
+If your system is different, look up the offending line and adapt it.
 
 # Dependencies
-- `lscpu`
+- PowerShell 5.1+ (all cmdlets used are built in: CIM, `Get-Counter`, `Get-NetIPConfiguration`, `Get-DnsClientServerAddress`)
 
-If your system is different, things might break. Look up the offending line and you can try to fix it for your specific system.
+Performance-counter names (`\Processor(_Total)\% Processor Time`, etc.) are English. On a non-English Windows install the counter paths are localized; each counter read is wrapped so a miss degrades to `0` rather than erroring, but you may want to substitute your locale's counter names.
 
 # Installation
 
-For login sessions over ssh, reference the script `~/.machine_report.sh` in your `.bashrc` file. Make sure the script is executable by running `chmod +x ~/.machine_report.sh`.
+Copy `machine_report.ps1` to a stable location, e.g. `~\machine_report.ps1` (`$HOME\machine_report.ps1`).
 
-Copy `machine_report.sh` from this repository and add it to `~/.machine_report.sh` ('.' for hidden file if you wish). Reference it in your `.bashrc` file as follows (example bashrc file):
+Reference it from your PowerShell profile so it runs on each interactive session. Open your profile with `notepad $PROFILE` (create it if prompted) and add:
 
-```bash
-# This is your .bashrc file. 
-# Add the following lines anywhere in the file.
-
-# Run Machine Report only when in interactive mode
-if [[ $- == *i* ]]; then
-    ~/.machine_report.sh
-fi
+```powershell
+# Run Machine Report only in an interactive console session
+if ($Host.Name -eq 'ConsoleHost') {
+    & "$HOME\machine_report.ps1"
+}
 ```
 
+If scripts are blocked by execution policy, allow local scripts for your user:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+For login sessions over SSH to a Windows host, the same profile line applies when the SSH default shell is PowerShell; `CLIENT IP` is read from `$env:SSH_CLIENT`.
+
 # License
-BSD 3 Clause License, Copyright © 2024, U.S. Graphics, LLC. See [`LICENSE`](https://github.com/usgraphics/machine-report-staging/blob/master/LICENSE) file for license information.
+BSD 3 Clause License, Copyright (c) 2024, U.S. Graphics, LLC. See [`LICENSE`](LICENSE) file for license information.
