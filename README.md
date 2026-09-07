@@ -1,3 +1,5 @@
+> **Windows only.** This fork runs on native Windows via PowerShell. It does **not** run on Linux, macOS, WSL, or Git Bash - the original bash script has been removed and everything lives in `machine_report.ps1`. For the Linux/bash original, see [usgraphics/usgc-machine-report](https://github.com/usgraphics/usgc-machine-report).
+
 NOT MAINTAINED ON PURPOSE. DIG INTO THE SCRIPT AND ADAPT IT FOR YOUR OWN USE CASE. CUSTOMIZE IT TO YOUR HEARTS CONTENT.
 
 # TR-100 Machine Report (Windows / PowerShell)
@@ -6,9 +8,7 @@ SKU: TR-100, filed under Technical Reports (TR).
 What is it?
 A machine information report used at [United States Graphics Company](https://x.com/usgraphics).
 
-"Machine Report" is similar to Neofetch, but very basic. This is a **native Windows PowerShell port** of the original bash script: it displays useful machine information right in the terminal session. Reference it from your PowerShell profile and it prints when you open a new shell (or log into the box over SSH). See installation instructions below.
-
-This fork is Windows-only. The original bash script has been dropped; everything lives in `machine_report.ps1`.
+"Machine Report" is similar to Neofetch, but very basic. It is a Windows PowerShell script that displays useful machine information right in the terminal session. Reference it from your PowerShell profile and it prints when you open a new shell (or log into the box over SSH). See installation instructions below.
 
 ## What differs from the original bash version
 
